@@ -210,14 +210,14 @@ module "vpc" {
   enable_dns_hostnames = true
 
   public_subnet_tags = {
-    "kubernetes.io/role/elb" = 1
+    "kubernetes.io/role/elb" = "1"
   }
   private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = 1
+    "kubernetes.io/role/internal-elb" = "1"
   }
 }
 
-# ── EKS Cluster ────────────────────────────────────────────────────────────────
+# ── EKS ────────────────────────────────────────────────────────────────────────
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 20.0"
@@ -225,37 +225,188 @@ module "eks" {
   cluster_name    = "${local.name_safe}-eks"
   cluster_version = "1.31"
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
-
+  vpc_id                         = module.vpc.vpc_id
+  subnet_ids                     = module.vpc.private_subnets
   cluster_endpoint_public_access = true
 
   eks_managed_node_groups = {
     default = {
-      name           = "${local.name_safe}-ng"
       instance_types = [var.node_instance_type]
       min_size       = var.min_nodes
       max_size       = var.max_nodes
-      desired_size   = var.replica_count
-
-      labels = {
-        project = var.project_name
-      }
+      desired_size   = var.min_nodes
     }
   }
-
-  # Allow cluster creator to manage resources without aws-auth configmap
-  enable_cluster_creator_admin_permissions = true
 }
 
-# ── ECR ────────────────────────────────────────────────────────────────────────
-data "aws_ecr_repository" "app" {
-  name = local.ecr_name
+# ── RDS (Postgres) ─────────────────────────────────────────────────────────────
+resource "aws_db_subnet_group" "main" {
+  name       = "${local.name_safe}-db-subnet"
+  subnet_ids = module.vpc.private_subnets
 }
 
-# ── Kubernetes Namespace ────────────────────────────────────────────────────────
+resource "aws_security_group" "rds" {
+  name   = "${local.name_safe}-rds-sg"
+  vpc_id = module.vpc.vpc_id
+
+  ingress {
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = [module.vpc.vpc_cidr_block]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_db_instance" "main" {
+  identifier             = "${local.name_safe}-db"
+  engine                 = "postgres"
+  engine_version         = "15"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  db_name                = local._rds_db_name
+  username               = local._rds_user
+  password               = var.rds_db_password != "" ? var.rds_db_password : "changeme123!"
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+}
+
+# ── Kubernetes namespace ───────────────────────────────────────────────────────
 resource "kubernetes_namespace" "app" {
   depends_on = [module.eks]
   metadata {
     name = local.namespace
     labels = {
+      name = local.namespace
+    }
+  }
+}
+
+# ── Kubernetes secret ──────────────────────────────────────────────────────────
+resource "kubernetes_secret" "app_env" {
+  depends_on = [kubernetes_namespace.app]
+  metadata {
+    name      = "${local.name_safe}-env"
+    namespace = local.namespace
+  }
+  data = local.app_env
+}
+
+# ── Kubernetes deployment ──────────────────────────────────────────────────────
+resource "kubernetes_deployment" "app" {
+  depends_on = [kubernetes_secret.app_env]
+  metadata {
+    name      = local.name_safe
+    namespace = local.namespace
+  }
+  spec {
+    replicas = var.replica_count
+    selector {
+      match_labels = { app = local.name_safe }
+    }
+    template {
+      metadata {
+        labels = { app = local.name_safe }
+      }
+      spec {
+        container {
+          name  = local.name_safe
+          image = var.container_image
+          port {
+            container_port = var.app_port
+          }
+          env_from {
+            secret_ref {
+              name = kubernetes_secret.app_env.metadata[0].name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# ── Kubernetes service ─────────────────────────────────────────────────────────
+resource "kubernetes_service" "app" {
+  depends_on = [kubernetes_deployment.app]
+  metadata {
+    name      = local.name_safe
+    namespace = local.namespace
+  }
+  spec {
+    selector = { app = local.name_safe }
+    port {
+      port        = 80
+      target_port = var.app_port
+    }
+    type = "ClusterIP"
+  }
+}
+
+# ── ALB Ingress Controller (Helm) ──────────────────────────────────────────────
+resource "helm_release" "alb_controller" {
+  depends_on = [module.eks]
+  name       = "aws-load-balancer-controller"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+  version    = "1.7.1"
+
+  set {
+    name  = "clusterName"
+    value = module.eks.cluster_name
+  }
+  set {
+    name  = "serviceAccount.create"
+    value = "true"
+  }
+}
+
+# ── Kubernetes ingress ─────────────────────────────────────────────────────────
+resource "kubernetes_ingress_v1" "app" {
+  depends_on = [helm_release.alb_controller]
+  metadata {
+    name      = local.name_safe
+    namespace = local.namespace
+    annotations = {
+      "kubernetes.io/ingress.class"               = "alb"
+      "alb.ingress.kubernetes.io/scheme"          = "internet-facing"
+      "alb.ingress.kubernetes.io/target-type"     = "ip"
+      "alb.ingress.kubernetes.io/healthcheck-path" = var.health_check_path
+    }
+  }
+  spec {
+    rule {
+      http {
+        path {
+          path      = "/"
+          path_type = "Prefix"
+          backend {
+            service {
+              name = kubernetes_service.app.metadata[0].name
+              port {
+                number = 80
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# ── Outputs ────────────────────────────────────────────────────────────────────
+output "cluster_name" {
+  value = module.eks.cluster_name
+}
+
+output "namespace" {
+  value = local.namespace
+}
