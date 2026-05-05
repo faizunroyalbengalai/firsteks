@@ -73,7 +73,11 @@ jobs:
       - name: Build & push Docker image
         run: |
           docker build -t ${{ steps.meta.outputs.image }} .
-          docker push ${{ steps.meta.outputs.image }}
+          for i in 1 2 3; do
+            docker push ${{ steps.meta.outputs.image }} && break
+            echo "Push attempt ${i} failed, retrying in 15s..."
+            sleep 15
+          done
 
   deploy:
     name: Deploy to EKS (Terraform + kubectl)
@@ -198,5 +202,4 @@ jobs:
           done
           if [ -z "$HOSTNAME" ]; then
             echo "ALB hostname not assigned within timeout — check AWS console"
-            echo "url=" >> $GITHUB_OUTPUT
           fi
